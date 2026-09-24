@@ -2,7 +2,6 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
-import time
 from enum import Enum
 
 
@@ -69,6 +68,10 @@ class SignalFusion:
             if fused:
                 fused_segments.append(fused)
         
+        # 已对齐的缓冲段全部消费完毕，清空避免下次 fuse 重复融合
+        self.bci_buffer.clear()
+        self.audio_buffer.clear()
+        
         self.fused_segments.extend(fused_segments)
         
         fused_text = " ".join([seg.text for seg in fused_segments if seg.text])
@@ -76,7 +79,7 @@ class SignalFusion:
         overall_confidence = 0.0
         if fused_segments:
             confidences = [seg.confidence for seg in fused_segments]
-            overall_confidence = np.mean(confidences)
+            overall_confidence = float(np.mean(confidences))
         
         return FusionResult(
             segments=fused_segments,
@@ -85,18 +88,25 @@ class SignalFusion:
         )
     
     def _clean_old_segments(self):
-        current_time = time.time()
+        all_segments = self.bci_buffer + self.audio_buffer
+        if not all_segments:
+            return
+        
+        # 以缓冲区内最新时间戳为基准，而不是墙钟时间：
+        # 信号段的时间戳可能来自流式相对时钟，与 time.time() 不可比
+        reference_time = max(seg.timestamp for seg in all_segments)
+        max_age = self.time_window * 10
         
         self.bci_buffer = [
             seg for seg in self.bci_buffer
-            if (current_time - seg.timestamp) < self.time_window * 10
+            if (reference_time - seg.timestamp) < max_age
         ]
         self.audio_buffer = [
             seg for seg in self.audio_buffer
-            if (current_time - seg.timestamp) < self.time_window * 10
+            if (reference_time - seg.timestamp) < max_age
         ]
     
-    def _align_timestamps(self) -> List[Tuple[Optional[TextSegment], Optional[TextSegment]]:
+    def _align_timestamps(self) -> List[Tuple[Optional[TextSegment], Optional[TextSegment]]]:
         pairs = []
         
         used_audio_indices = set()
@@ -127,6 +137,14 @@ class SignalFusion:
             if i not in used_audio_indices:
                 pairs.append((None, audio_seg))
         
+        # 按时间戳排序，保证融合结果（及拼接文本）保持时间顺序
+        def _pair_timestamp(pair):
+            bci_seg, audio_seg = pair
+            return min(seg.timestamp for seg in (bci_seg, audio_seg)
+                       if seg is not None)
+        
+        pairs.sort(key=_pair_timestamp)
+        
         return pairs
     
     def _fuse_pair(
@@ -140,7 +158,7 @@ class SignalFusion:
         if bci_seg is None:
             return TextSegment(
                 text=audio_seg.text,
-                confidence=audio_seg.confidence * self.audio_weight,
+                confidence=audio_seg.confidence,
                 timestamp=audio_seg.timestamp,
                 source=SignalSource.FUSED,
                 speaker_id=audio_seg.speaker_id,
@@ -151,7 +169,7 @@ class SignalFusion:
         if audio_seg is None:
             return TextSegment(
                 text=bci_seg.text,
-                confidence=bci_seg.confidence * self.bci_weight,
+                confidence=bci_seg.confidence,
                 timestamp=bci_seg.timestamp,
                 source=SignalSource.FUSED,
                 speaker_id=bci_seg.speaker_id,
@@ -161,10 +179,16 @@ class SignalFusion:
         
         fused_text = self._merge_texts(bci_seg.text, audio_seg.text)
         
-        fused_confidence = (
-            bci_seg.confidence * self.bci_weight +
-            audio_seg.confidence * self.audio_weight
-        )
+        # 按实际参与融合的权重归一化，避免权重和不为 1 时置信度失真
+        total_weight = self.bci_weight + self.audio_weight
+        if total_weight > 0:
+            fused_confidence = (
+                bci_seg.confidence * self.bci_weight +
+                audio_seg.confidence * self.audio_weight
+            ) / total_weight
+        else:
+            fused_confidence = 0.0
+        fused_confidence = min(1.0, max(0.0, fused_confidence))
         
         speaker_id = audio_seg.speaker_id or bci_seg.speaker_id
         
@@ -225,7 +249,8 @@ class WeakSignalEnhancer:
         signal: np.ndarray,
         confidence: float
     ) -> Tuple[np.ndarray, float]:
-        signal_power = np.mean(np.abs(signal))
+        # 信号功率应为均方值 mean(x^2)，而非平均幅值 mean(|x|)
+        signal_power = float(np.mean(np.square(signal)))
         
         if signal_power < self.noise_floor:
             if self.adaptive_threshold:
@@ -235,7 +260,7 @@ class WeakSignalEnhancer:
                 adaptive_factor = self.enhancement_factor
             
             enhanced_signal = signal * adaptive_factor
-            enhanced_confidence = min(1.0, confidence * (1 + (adaptive_factor - 1) * 0.5)
+            enhanced_confidence = min(1.0, confidence * (1 + (adaptive_factor - 1) * 0.5))
         else:
             enhanced_signal = signal
             enhanced_confidence = confidence
@@ -287,7 +312,7 @@ class MultiModalFusion:
         overall_confidence = 0.0
         if merged:
             confidences = [seg.confidence for seg in merged]
-            overall_confidence = np.mean(confidences)
+            overall_confidence = min(1.0, float(np.mean(confidences)))
         
         return FusionResult(
             segments=merged,
@@ -305,7 +330,11 @@ class MultiModalFusion:
             last = merged[-1]
             
             if seg.timestamp - last.timestamp < 1.0 and last.speaker_id == seg.speaker_id:
-                merged_text = f"{last.text} {seg.text}".strip()
+                # 相同/已包含的文本不重复拼接，避免多模态重复内容出现 "hello hello"
+                if seg.text and seg.text not in last.text:
+                    merged_text = f"{last.text} {seg.text}".strip()
+                else:
+                    merged_text = last.text
                 merged_conf = (last.confidence + seg.confidence) / 2
                 
                 merged[-1] = TextSegment(
